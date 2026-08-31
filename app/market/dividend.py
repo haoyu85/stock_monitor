@@ -32,6 +32,7 @@ class DividendProvider:
     def __init__(self):
         self._stock_cache: dict[str, tuple[float, float]] = {}     # symbol → (ts, div_per_share)
         self._benchmark_cache: tuple[float, float] | None = None   # (ts, div_yield_pct)
+        self.last_error: str | None = None
 
     # ------------------------------------------------------------------
     # 个股分红
@@ -39,6 +40,7 @@ class DividendProvider:
 
     def get_stock_dividend(self, symbol: str) -> float:
         """获取个股最近一次每股分红（元），无数据返回 0。"""
+        self.last_error = None
         today = datetime.now().strftime("%Y%m%d")
 
         if symbol in self._stock_cache:
@@ -72,6 +74,7 @@ class DividendProvider:
             return div_per_share
 
         except Exception as e:
+            self.last_error = str(e)
             logger.error(f"个股分红获取失败 {symbol}: {e}")
             return 0.0
 
@@ -84,6 +87,7 @@ class DividendProvider:
 
         股息率 = (最新累计 - 前次累计) / 510880当前价 * 100
         """
+        self.last_error = None
         if self._benchmark_cache is not None:
             ts, val = self._benchmark_cache
             if time.time() - ts < 7200:  # TTL 2h
@@ -103,6 +107,7 @@ class DividendProvider:
             if annual_div <= 0:
                 return self._fallback()
         except Exception as e:
+            self.last_error = str(e)
             logger.error(f"510880 分红数据获取失败: {e}")
             return self._fallback()
 
@@ -120,6 +125,7 @@ class DividendProvider:
             if price <= 0:
                 return self._fallback()
         except Exception as e:
+            self.last_error = str(e)
             logger.error(f"510880 价格获取失败: {e}")
             return self._fallback()
 

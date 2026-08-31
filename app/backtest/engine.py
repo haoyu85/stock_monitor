@@ -7,11 +7,14 @@
 
 import logging
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Optional
 
 import pandas as pd
 
 from app.backtest.metrics import compute_metrics
+from app.market.dividend_repository import DividendRepository
+from app.strategy.policy import StrategyExecutionState, StrategyPolicy
 
 logger = logging.getLogger(__name__)
 
@@ -19,12 +22,15 @@ logger = logging.getLogger(__name__)
 class BacktestBroker:
     """回测专用模拟账户。"""
 
-    def __init__(self, initial_capital: float, position_ratio: float = 0.1):
+    def __init__(self, initial_capital: float, position_ratio: float = 0.1,
+                 etf_lot: int = 100, stock_lot: int = 100):
         self.initial_capital = initial_capital
         self.cash = initial_capital
         self.positions: dict[str, dict] = {}
         self.trades: list[dict] = []
         self.position_ratio = position_ratio
+        self.etf_lot = etf_lot
+        self.stock_lot = stock_lot
 
     def equity(self, price_map: dict[str, float]) -> float:
         mv = sum(self.positions[s]["shares"] * price_map.get(s, 0)
@@ -37,8 +43,9 @@ class BacktestBroker:
             return 0
         equity = self.cash  # 保守：用现金而非总权益，避免高估值时过度买入
         target = equity * self.position_ratio
-        qty = int(target / price / 100) * 100
-        return max(100, qty)
+        lot = self.etf_lot if symbol.startswith(("5", "1", "58", "16")) else self.stock_lot
+        qty = int(target / price / lot) * lot
+        return max(lot, qty)
 
     def buy(self, symbol: str, price: float, quantity: int, date: str, reason: str = "") -> bool:
         cost = price * quantity + 5
@@ -75,11 +82,14 @@ class BacktestBroker:
 class BacktestEngine:
     """逐日回测引擎。"""
 
-    def __init__(self, config, strategy_engine, market_data):
+    def __init__(self, config, strategy_engine, market_data, dividend_repository: DividendRepository | None = None):
         self._config = config
         self._engine = strategy_engine
         self._market = market_data
-        self._market._config.cache_ttl = 99999
+        self._policy = StrategyPolicy(strategy_engine, config)
+        self._dividend_repository = dividend_repository or DividendRepository(
+            Path(config.system.data_dir) / "market_cache.db"
+        )
 
     def run(
         self,
@@ -99,15 +109,14 @@ class BacktestEngine:
             days_needed = max(250, int((end_dt - start_dt).days * 5 / 7) + 250)
         except ValueError:
             days_needed = 250
-        self._force_kline_fetch(symbols, days_needed)
-
-        broker = BacktestBroker(initial_capital, position_ratio=position_ratio)
-
         strategy = self._engine.get(strategy_id)
         if strategy is None:
             return {"error": f"策略不存在: {strategy_id}"}
 
-        filter_func = self._engine.get_symbol_filter(strategy_id)
+        self._market.ensure_history(symbols, days_needed)
+
+        broker = BacktestBroker(initial_capital, position_ratio=position_ratio)
+
 
         # 分红数据预取（回测期间股息率 = 最新分红 / 历史时点价格）
         self._div_data = self._prefetch_dividends(symbols)
@@ -120,9 +129,7 @@ class BacktestEngine:
 
         # 权益曲线从指定起始日开始
         equity_curve = [{"date": start_date, "value": initial_capital}]
-        signals_today: set = set()  # 当日去重: (symbol, action)
-        recent_signals: dict[tuple, int] = {}  # 跨日去重: (symbol, action) → last_ti
-        buy_cooldown, sell_cooldown = self._engine.get_cooldown(strategy_id)
+        state = StrategyExecutionState()
 
         trading_dates = self._build_trading_calendar(symbols, start_date, end_date)
         logger.info(f"回测开始: {strategy.name} × {len(symbols)} 只, "
@@ -151,11 +158,10 @@ class BacktestEngine:
 
         for ti, dt in enumerate(trading_dates):
             date_str = dt.strftime("%Y-%m-%d")
-            signals_today.clear()
+            state.next_day()
 
-            if not skip_filter and filter_func:
-                meta = {s: {"name": s} for s in symbols}
-                active = [s for s in filter_func(symbols, meta) if s in symbols]
+            if not skip_filter and self._engine.get_symbol_filter(strategy_id):
+                active = self._policy.applicable_symbols(strategy_id, symbols)
                 if not active:
                     return {"error": f"策略 \"{strategy.name}\" 的标的过滤未匹配任何选中标的（策略限制：仅 ETF 等特定类型）"}
             else:
@@ -191,35 +197,22 @@ class BacktestEngine:
                 try:
                     result = self._engine.execute(strategy.id, context, data)
 
-                    if result["action"] == "hold":
-                        continue
-                    if result["strength"] < self._config.scheduler.min_signal_strength:
+                    if not self._policy.accepts_strength(result):
                         continue
 
-                    # 去重：当日 + 跨日冷却期
-                    key = (sym, result["action"])
-                    if key in signals_today:
+                    if not self._policy.can_emit(state, strategy.id, sym, result["action"], ti):
                         continue
-                    cooldown = buy_cooldown if result["action"] == "buy" else sell_cooldown
-                    if ti - recent_signals.get(key, -999) < cooldown:
-                        continue
-                    signals_today.add(key)
-                    recent_signals[key] = ti
 
                     price = price_map.get(sym, 0)
                     if price <= 0:
                         continue
 
+                    result = self._policy.apply_market_regime(result, benchmark_regime.get(date_str, {}) if benchmark_regime else None)
+                    if result is None:
+                        continue
+                    self._policy.mark_emitted(state, strategy.id, sym, result["action"], ti)
+
                     if result["action"] == "buy":
-                        # 大盘择时过滤
-                        if benchmark_regime:
-                            regime = benchmark_regime.get(date_str, {})
-                            if not regime.get("above_ma_bear", True):
-                                continue  # MA200 下方不买
-                            if not regime.get("above_ma_weak", True):
-                                result["strength"] *= mt.strength_discount
-                                if result["strength"] < self._config.scheduler.min_signal_strength:
-                                    continue
                         qty = broker.calc_quantity(sym, price)
                         broker.buy(sym, price, qty, date_str, result.get("reason", ""))
 
@@ -272,7 +265,7 @@ class BacktestEngine:
         position_ratio: float = 0.1,
     ) -> dict:
         """多策略组合回测，共享同一资金池，信号按强度优先级竞争资金。"""
-        self._market.preload_kline_cache(symbols)
+        self._market.ensure_history(symbols, 250)
         broker = BacktestBroker(initial_capital, position_ratio=position_ratio)
 
         strategies = [s for s in (self._engine.get(sid) for sid in strategy_ids) if s]
@@ -283,12 +276,7 @@ class BacktestEngine:
         benchmark_regime = self._compute_benchmark_regime(mt.benchmark) if mt.enabled else {}
 
         equity_curve = [{"date": start_date, "value": initial_capital}]
-        signals_today: set = set()
-        recent_signals: dict[tuple, int] = {}
-        # 组合回测取各策略最保守的冷却
-        cooldowns = [self._engine.get_cooldown(s.id) for s in strategies]
-        buy_cooldown = max((c[0] for c in cooldowns), default=0)
-        sell_cooldown = max((c[1] for c in cooldowns), default=0)
+        state = StrategyExecutionState()
         trading_dates = self._build_trading_calendar(symbols, start_date, end_date)
 
         all_histories, sym_close, sym_pos = {}, {}, {}
@@ -314,7 +302,7 @@ class BacktestEngine:
 
         for ti, dt in enumerate(trading_dates):
             date_str = dt.strftime("%Y-%m-%d")
-            signals_today.clear()
+            state.next_day()
             price_map = {}
             for sym in all_histories:
                 p = sym_pos[sym].get(ti)
@@ -330,12 +318,7 @@ class BacktestEngine:
 
             pending = []
             for strategy in strategies:
-                filter_func = None if skip_filter else self._engine.get_symbol_filter(strategy.id)
-                if filter_func:
-                    meta = {s: {"name": s} for s in symbols}
-                    active = [s for s in filter_func(symbols, meta) if s in symbols]
-                else:
-                    active = list(symbols)
+                active = list(symbols) if skip_filter else self._policy.applicable_symbols(strategy.id, symbols)
                 for sym in active:
                     if sym not in sym_pos:
                         continue
@@ -351,36 +334,24 @@ class BacktestEngine:
 
                     try:
                         result = self._engine.execute(strategy.id, context, data)
-                        if result["action"] == "hold":
-                            continue
-                        if result["strength"] < self._config.scheduler.min_signal_strength:
+                        if not self._policy.accepts_strength(result):
                             continue
                         price = price_map.get(sym, 0)
                         if price <= 0:
                             continue
-                        pending.append((result["strength"], sym, result, price))
+                        pending.append((result["strength"], strategy, sym, result, price))
                     except Exception:
                         pass
 
             pending.sort(key=lambda x: x[0], reverse=True)
-            for _, sym, result, price in pending:
-                key = (sym, result["action"])
-                if key in signals_today:
+            for _, strategy, sym, result, price in pending:
+                if not self._policy.can_emit(state, strategy.id, sym, result["action"], ti):
                     continue
-                cooldown = buy_cooldown if result["action"] == "buy" else sell_cooldown
-                if ti - recent_signals.get(key, -999) < cooldown:
+                result = self._policy.apply_market_regime(result, benchmark_regime.get(date_str, {}) if benchmark_regime else None)
+                if result is None:
                     continue
-                signals_today.add(key)
-                recent_signals[key] = ti
+                self._policy.mark_emitted(state, strategy.id, sym, result["action"], ti)
                 if result["action"] == "buy":
-                    if benchmark_regime:
-                        regime = benchmark_regime.get(date_str, {})
-                        if not regime.get("above_ma_bear", True):
-                            continue
-                        if not regime.get("above_ma_weak", True):
-                            result["strength"] *= mt.strength_discount
-                            if result["strength"] < self._config.scheduler.min_signal_strength:
-                                continue
                     qty = broker.calc_quantity(sym, price)
                     broker.buy(sym, price, qty, date_str, result.get("reason", ""))
                 elif result["action"] == "sell":
@@ -411,128 +382,16 @@ class BacktestEngine:
                 "final_positions": final_positions}
 
     def _force_kline_fetch(self, symbols: list[str], datalen: int) -> None:
-        """若缓存已满足长度需求则跳过，否则重新拉取 K 线。"""
-        import sqlite3 as _sql, requests as _r
-
-        # 检查是否已有足够长度的数据
-        sample = self._market.get_history(symbols[0], period="days", freq="daily")
-        if not sample.empty and len(sample) >= datalen * 0.9:
-            logger.info(f"K线缓存已满足 ({len(sample)}条 >= {int(datalen*0.9)})，跳过拉取")
-            return
-
-        logger.info(f"K线缓存不足 ({len(sample)} < {int(datalen*0.9)})，拉取 {len(symbols)} 只")
-        # 1) 清除内存缓存
-        for sym in symbols:
-            self._market._cache.pop(f"hist_{sym}_days_daily", None)
-        # 2) 清除 SQLite 中的旧 K 线
-        try:
-            db = self._market._kline_db
-            if db.exists():
-                conn = _sql.connect(str(db))
-                for sym in symbols:
-                    conn.execute("DELETE FROM kline_daily WHERE symbol=?", (sym,))
-                conn.commit()
-                conn.close()
-        except Exception:
-            pass
-        # 3) 临时覆盖 datalen 参数
-        orig_fetch = self._market._fetch_history
-
-        def _fetch_with_datalen(symbol, period, freq):
-            prefix = "sh" if str(symbol).startswith(("5", "6", "9")) else "sz"
-            url = "https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData"
-            params = {"symbol": f"{prefix}{symbol}", "scale": "240",
-                      "ma": "5,10,20", "datalen": str(datalen)}
-            resp = _r.get(url, params=params,
-                          headers={"Referer": "https://finance.sina.com.cn"},
-                          timeout=self._market._config.timeout)
-            data = resp.json()
-            if not data:
-                raise Exception(f"历史数据为空: {symbol}")
-            import pandas as _pd
-            df = _pd.DataFrame(data)
-            df = df.rename(columns={"day": "date", "open": "open", "high": "high",
-                                    "low": "low", "close": "close", "volume": "volume"})
-            for col in ["open", "high", "low", "close", "volume"]:
-                if col in df.columns:
-                    df[col] = _pd.to_numeric(df[col], errors="coerce")
-            df["date"] = _pd.to_datetime(df["date"])
-            df = df.set_index("date").sort_index()
-            return df
-
-        self._market._fetch_history = _fetch_with_datalen
-        try:
-            self._market.preload_kline_cache(symbols)
-        finally:
-            self._market._fetch_history = orig_fetch
+        """Compatibility shim; uses MarketData's supported public API."""
+        self._market.ensure_history(symbols, datalen)
 
     def _prefetch_dividends(self, symbols: list[str]) -> dict:
-        """预取分红时间序列 + ETF 基准历史价格，用于回测期间按历史时点计算股息率。
+        """Load historical dividends from the local repository only.
 
-        Returns:
-            dict with keys:
-              - "etf_dividends": list[tuple[date, annual_div_per_unit]]  510880 年度分红
-              - "etf_prices": dict[str, float]  510880 日线价格 {date_str: price}
-              - "<symbol>": list[tuple[date, div_per_share]]  个股除权日升序
+        Backtesting intentionally has no AKShare/CNINFO path: absent repository
+        data simply yields zero dividend yield for the affected strategy run.
         """
-        import akshare as ak
-        data: dict = {}
-        data["etf_dividends"] = []
-        data["etf_prices"] = {}
-
-        # ── ETF 基准：510880 历史分红 + 日线价格 ──
-        try:
-            div_df = ak.fund_etf_dividend_sina(symbol="sh510880")
-            if div_df is not None and not div_df.empty:
-                timeline = []
-                for i in range(len(div_df)):
-                    d = pd.to_datetime(div_df.iloc[i, 0]).date()
-                    cum = float(div_df.iloc[i, 1])
-                    annual = cum - float(div_df.iloc[i-1, 1]) if i > 0 else cum
-                    timeline.append((d, annual))
-                data["etf_dividends"] = timeline
-
-            # 510880 价格历史（走 force_kline_fetch 保证足够长度）
-            self._force_kline_fetch(["510880"], 2000)
-            price_hist = self._market.get_history("510880", period="days", freq="daily")
-            if not price_hist.empty and "close" in price_hist.columns:
-                for idx, row in price_hist.iterrows():
-                    d = idx.date() if hasattr(idx, "date") else pd.Timestamp(idx).date()
-                    data["etf_prices"][d.isoformat()] = float(row["close"])
-        except Exception as e:
-            logger.warning(f"ETF 基准历史数据加载失败: {e}")
-
-        # ── 个股分红时间序列 ──
-        stock_syms = [s for s in symbols if not s.startswith(("5", "1", "58", "16"))]
-        for sym in stock_syms:
-            try:
-                df = ak.stock_dividend_cninfo(symbol=sym)
-                if df is None or df.empty:
-                    data[sym] = []
-                    continue
-
-                div_col = df.columns[4]   # 派息比例 (每10股)
-                date_col = df.columns[6]  # 除权日
-
-                valid = df[df[div_col].notna() & (df[div_col] > 0)].copy()
-                if valid.empty:
-                    data[sym] = []
-                    continue
-
-                valid[date_col] = pd.to_datetime(valid[date_col], errors="coerce")
-                valid = valid.dropna(subset=[date_col]).sort_values(date_col)
-
-                timeline = []
-                for _, r in valid.iterrows():
-                    ex_date = r[date_col].date()
-                    dps = float(r[div_col]) / 10  # 每10股 → 每股
-                    timeline.append((ex_date, dps))
-
-                data[sym] = timeline
-            except Exception:
-                data[sym] = []
-
-        return data
+        return self._dividend_repository.backtest_data(symbols)
 
     @staticmethod
     def _nearest_price(prices: dict[str, float], target) -> float:
@@ -593,7 +452,11 @@ class BacktestEngine:
         """
         mt = self._config.market_timing
         result = {}
-        hist = self._market.get_history(benchmark, period="days", freq="daily")
+        try:
+            hist = self._market.get_history(benchmark, period="days", freq="daily")
+        except Exception as exc:
+            logger.warning("回测基准数据不可用，跳过大盘择时: %s", exc)
+            return result
         if hist.empty or "close" not in hist.columns:
             return result
         close = hist["close"]

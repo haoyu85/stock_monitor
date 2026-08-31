@@ -24,21 +24,32 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
 from app.config import AppConfig
+from app.context import AppContext
 from app.market.data import MarketData
 from app.notify.base import Notification, NotifyLevel
 from app.notify.manager import NotificationManager
 from app.strategy.engine import StrategyEngine
+from app.strategy.policy import StrategyExecutionState, StrategyPolicy
 from app.symbols.manager import SymbolManager
-from app.trade.broker import OrderSide
-from app.trade.paper import PaperBroker
 from app.trade.positions import PositionStore
-from app.market.dividend import DividendProvider
 from app.scheduler.summary import build_closing_summary
 
 logger = logging.getLogger(__name__)
 
 # 全局标志，支持优雅退出
 _shutdown_flag = False
+
+
+def _signal_record(strategy, symbol: str, action: str, price: float, reason: str, strength: float) -> dict:
+    return {
+        "strategy_id": strategy.id,
+        "strategy_name": strategy.name,
+        "symbol": symbol,
+        "action": action,
+        "price": price,
+        "reason": reason,
+        "strength": strength,
+    }
 
 
 class MonitorLoop:
@@ -52,20 +63,24 @@ class MonitorLoop:
         loop.run_daemon()   # 守护进程模式
     """
 
-    def __init__(self, config: AppConfig):
-        self._config = config
+    def __init__(self, config: AppConfig | None = None, context: AppContext | None = None):
+        """Create a loop; new production code supplies one shared ``AppContext``.
 
-        # 初始化各模块
-        self._market = MarketData(config.market)
-        self._symbols = SymbolManager(config.symbols, self._market)
-        self._engine = StrategyEngine(config)
-        self._broker = PaperBroker(config)
-
-        # 初始化推送管理器（统一管理多渠道）
-        self._notify_mgr = NotificationManager(config)
-        self._positions = PositionStore(str(
-            Path(config.system.data_dir) / "positions.json"
-        ))
+        ``config`` remains accepted for compatibility with existing scripts and tests.
+        """
+        if context is None:
+            if config is None:
+                raise ValueError("MonitorLoop requires config or context")
+            context = AppContext(config)
+        self._context = context
+        self._config = context.config
+        self._market = context.market
+        self._symbols = context.symbols
+        self._engine = context.strategies
+        self._notify_mgr = context.notifications
+        self._positions = context.positions
+        self._dividends = context.dividends
+        self._policy = StrategyPolicy(self._engine, self._config)
         # 大盘择时缓存：每次 run_once 重新计算一次
         self._market_regime: dict | None = None
 
@@ -89,8 +104,13 @@ class MonitorLoop:
             执行摘要 dict。
         """
         start = time.time()
-        active_symbols = self._symbols.get_active_symbols()
-        strategies = self._engine.list_all(enabled_only=True)
+        # Pin every mutable application input before any I/O.  Web edits made
+        # while quotes/K-lines are loading intentionally become visible next run.
+        run_snapshot = self._context.take_monitor_snapshot()
+        active_symbols = list(run_snapshot.symbols)
+        strategy_runs = list(run_snapshot.strategies)
+        strategies = [entry.record for entry in strategy_runs]
+        positions_snapshot = [dict(position) for position in run_snapshot.positions]
 
         if not active_symbols:
             logger.warning("无活动标的")
@@ -140,47 +160,34 @@ class MonitorLoop:
                     "close": price_map[s],
                     "volume": float(r.get("volume", 0) or 0),
                 }
-        self._broker.update_market_prices(price_map)
-
-        held_syms = {p["symbol"] for p in self._positions.list_all()}
+        # Real positions are the only live portfolio source; the snapshot was
+        # captured before external I/O and is used for this entire iteration.
+        position_map = {p["symbol"]: p for p in positions_snapshot}
+        held_syms = set(position_map)
         signals_generated = 0
         filtered_signals = 0
         trades_executed = 0
         pending_signals: list[dict] = []  # 全部信号收集器，循环结束后合并推送
 
-        # Step 2: 预构建股息率映射（ETF 用 510880 红利基准，个股并行拉取分红数据）
-        div_provider = DividendProvider()
-        etf_benchmark = div_provider.get_etf_benchmark_yield()
-        stock_syms = [s for s in active_symbols if not s.startswith(("5", "1", "58", "16"))]
-        stock_dividends: dict[str, float] = {}
-
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        with ThreadPoolExecutor(max_workers=8) as pool:
-            futures = {pool.submit(div_provider.get_stock_dividend, s): s for s in stock_syms}
-            for f in as_completed(futures):
-                sym = futures[f]
-                try:
-                    stock_dividends[sym] = f.result()
-                except Exception:
-                    stock_dividends[sym] = 0.0
-
-        div_yields: dict[str, float] = {}
-        for sym in active_symbols:
-            price = price_map.get(sym, 0)
-            if price <= 0:
-                div_yields[sym] = 0.0
-            elif sym in stock_dividends:
-                dps = stock_dividends[sym]
-                div_yields[sym] = round(dps / price * 100, 2) if dps > 0 else 0.0
-            else:
-                div_yields[sym] = etf_benchmark
+        # Step 2 (slow-data boundary): cache reads only. Dividend refresh is explicit
+        # and deliberately never invoked from this fast path.
+        div_yields = self._dividends.get_yields(active_symbols, price_map)
 
         # Step 3: 遍历策略 x 标的
         self._market_regime = None
-        context = self._broker.get_context()
+        context = self._build_live_strategy_context(positions_snapshot, price_map)
+        state = StrategyExecutionState(
+            today_keys=self._engine.load_today_signal_keys(),
+            recent_signals=self._engine.load_recent_signal_ticks(),
+        )
+        pending_signal_logs: list[dict] = []
 
-        for strategy in strategies:
-            symbols = active_symbols
+        for strategy_run in strategy_runs:
+            strategy = strategy_run.record
+            symbols = self._policy.applicable_symbols(
+                strategy.id, active_symbols, run_snapshot.symbol_meta,
+                selector=strategy_run.symbol_filter,
+            )
 
             for symbol in symbols:
                 context["div_yield"] = div_yields.get(symbol, 0.0)
@@ -203,62 +210,49 @@ class MonitorLoop:
                     hist_data = hist_data[~hist_data.index.duplicated(keep="last")]
                     hist_data = hist_data.sort_index()
                 try:
-                    result = self._engine.execute(strategy.id, context, hist_data)
+                    result = self._engine.execute_record(strategy, context, hist_data)
 
                     if result["action"] == "hold":
                         continue
 
-                    # 强度阈值过滤
-                    if result["strength"] < self._config.scheduler.min_signal_strength:
+                    if not self._policy.accepts_strength(result):
                         continue
 
-                    # 当天去重：同标的+同策略+同方向已报过则跳过
-                    if self._engine.has_signal_today(strategy.id, symbol, result["action"]):
+                    tick = datetime.now().date().toordinal()
+                    if not self._policy.can_emit(
+                        state, strategy.id, symbol, result["action"], tick,
+                        cooldown=strategy_run.cooldown,
+                    ):
                         continue
 
                     # 大盘择时过滤（仅买入信号）
                     if result["action"] == "buy" and self._config.market_timing.enabled:
                         regime = self._check_market_regime()
-                        if not regime["above_ma_bear"]:
+                        adjusted = self._policy.apply_market_regime(result, regime)
+                        if adjusted is None:
                             filtered_signals += 1
-                            reason = f"{result['reason']} [大盘择时拦截: MA{self._config.market_timing.ma_bear}熊市]"
-                            if not self._engine.has_signal_today(strategy.id, symbol, "filtered"):
-                                self._engine.log_signal(
-                                    strategy_id=strategy.id, strategy_name=strategy.name,
-                                    symbol=symbol, action="filtered",
-                                    price=price_map.get(symbol, 0),
-                                    reason=reason, strength=result["strength"],
-                                )
+                            if not regime["above_ma_bear"]:
+                                reason = f"{result['reason']} [大盘择时拦截: MA{self._config.market_timing.ma_bear}熊市]"
+                            else:
+                                discount = self._config.market_timing.strength_discount
+                                weak_result = dict(result)
+                                weak_result["strength"] *= discount
+                                weak_result["reason"] = f"{weak_result['reason']} [弱市x{discount}]"
+                                reason = f"{weak_result['reason']} [强度{weak_result['strength']:.2f}<阈值]"
+                            if self._policy.can_emit(
+                                state, strategy.id, symbol, "filtered", tick,
+                                cooldown=strategy_run.cooldown,
+                            ):
+                                self._policy.mark_emitted(state, strategy.id, symbol, "filtered", tick)
+                                pending_signal_logs.append(_signal_record(strategy, symbol, "filtered", price_map.get(symbol, 0), reason, result["strength"]))
                             continue
-                        if not regime["above_ma_weak"]:
-                            discount = self._config.market_timing.strength_discount
-                            result["strength"] *= discount
-                            result["reason"] += f" [弱市x{discount}]"
-                            if result["strength"] < self._config.scheduler.min_signal_strength:
-                                filtered_signals += 1
-                                if not self._engine.has_signal_today(strategy.id, symbol, "filtered"):
-                                    self._engine.log_signal(
-                                        strategy_id=strategy.id, strategy_name=strategy.name,
-                                        symbol=symbol, action="filtered",
-                                        price=price_map.get(symbol, 0),
-                                        reason=f"{result['reason']} [强度{result['strength']:.2f}<阈值]",
-                                        strength=result["strength"],
-                                    )
-                                continue
+                        result = adjusted
 
                     signals_generated += 1
                     current_price = price_map.get(symbol, 0)
 
-                    # 记录信号
-                    self._engine.log_signal(
-                        strategy_id=strategy.id,
-                        strategy_name=strategy.name,
-                        symbol=symbol,
-                        action=result["action"],
-                        price=current_price,
-                        reason=result["reason"],
-                        strength=result["strength"],
-                    )
+                    self._policy.mark_emitted(state, strategy.id, symbol, result["action"], tick)
+                    pending_signal_logs.append(_signal_record(strategy, symbol, result["action"], current_price, result["reason"], result["strength"]))
 
                     # Step 3: 收集信号（以真实持仓 PositionStore 为准，不触发虚拟成交）
                     held = symbol in held_syms
@@ -272,6 +266,8 @@ class MonitorLoop:
                 except Exception as e:
                     logger.error(f"处理 {strategy.name} x {symbol} 时出错: {e}", exc_info=True)
 
+        self._engine.log_signals_batch(pending_signal_logs)
+
         # 合并推送
         if pending_signals:
             self._notify_batch(pending_signals, name_map)
@@ -283,7 +279,7 @@ class MonitorLoop:
 
         # 真实持仓汇总
         total_mv, total_cost, total_pnl = 0.0, 0.0, 0.0
-        for p in self._positions.list_all():
+        for p in positions_snapshot:
             price = price_map.get(p["symbol"], 0)
             mv = price * p["shares"] if price > 0 else 0
             pnl = (price - p["cost"]) * p["shares"] if price > 0 else 0
@@ -312,6 +308,22 @@ class MonitorLoop:
         logger.info(f"监测完成: {summary}")
         return summary
 
+    @staticmethod
+    def _build_live_strategy_context(positions: list[dict], price_map: dict[str, float]) -> dict:
+        """Build live context from the actual PositionStore snapshot only."""
+        position_map = {p["symbol"]: int(p.get("shares", 0)) for p in positions}
+        holdings = {symbol: round(shares * float(price_map.get(symbol, 0) or 0), 2)
+                    for symbol, shares in position_map.items()}
+        return {
+            "positions": position_map,
+            "holdings": holdings,
+            "cash": None,
+            "signals": [],
+            "position_count": len(position_map),
+            "div_yield": 0.0,
+            "is_etf": False,
+        }
+
     def run_daemon(self) -> None:
         """以守护进程模式持续运行。
 
@@ -333,6 +345,16 @@ class MonitorLoop:
             id="monitor_tick",
             name="监测心跳",
         )
+
+        # Slow CNINFO/AKShare work is scheduled independently of the fast
+        # quote/K-line loop.  A failure leaves the last SQLite cache untouched.
+        self._scheduler.add_job(
+            self._refresh_dividend_cache,
+            CronTrigger(day_of_week="mon-fri", hour=8, minute=15),
+            id="dividend_refresh",
+            name="分红缓存刷新",
+        )
+        logger.info("分红缓存刷新已注册: 交易日 08:15")
 
         # LOF 日报定时推送（交易日 14:30，含预警）
         if self._config.lof.enabled and self._config.lof.report.enabled:
@@ -396,11 +418,22 @@ class MonitorLoop:
 
     @property
     def notification_history(self) -> list[dict]:
-        return self._notify_mgr._history if hasattr(self, '_notify_mgr') else []
+        return self._notify_mgr.history_snapshot() if hasattr(self, '_notify_mgr') else []
 
     # ------------------------------------------------------------------
     # 内部方法
     # ------------------------------------------------------------------
+
+    def _refresh_dividend_cache(self) -> None:
+        """Run low-frequency dividend refresh outside the monitor fast path."""
+        symbols = list(self._symbols.snapshot().symbols)
+        try:
+            outcome = self._dividends.refresh(symbols)
+            logger.info("Dividend scheduled refresh completed: %s", outcome)
+        except Exception as exc:
+            # ``DividendService`` isolates per-symbol failures.  This guard keeps
+            # scheduler failures from affecting monitor availability as well.
+            logger.warning("Dividend scheduled refresh failed; cache retained: %s", exc)
 
     def _check_market_regime(self) -> dict:
         """检查大盘环境。

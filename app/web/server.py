@@ -33,15 +33,9 @@ from flask import (
 )
 
 from app.config import AppConfig
-from app.market.data import MarketData
+from app.context import AppContext
 from app.market.lof_data import LOFDataProvider
-from app.notify.manager import NotificationManager
-from app.strategy.engine import StrategyEngine
 from app.strategy.llm import LLMStrategyGenerator
-from app.symbols.manager import SymbolManager
-from app.trade.paper import PaperBroker
-from app.trade.positions import PositionStore
-from app.trade.broker import OrderStatus
 from app.backtest.engine import BacktestEngine
 from app.symbols.groups import GroupStore, DEFAULT_GROUPS
 
@@ -108,8 +102,9 @@ def login_required(f):
 
 
 def create_app(
-    config: AppConfig,
+    config: AppConfig | None = None,
     monitor_loop=None,
+    context: AppContext | None = None,
 ) -> Flask:
     """创建并配置 Flask 应用。
 
@@ -120,6 +115,11 @@ def create_app(
     Returns:
         Flask 应用对象。
     """
+    if context is None:
+        if config is None:
+            raise ValueError("create_app requires config or context")
+        context = AppContext(config)
+    config = context.config
     global _monitor_loop, _app_config
     _monitor_loop = monitor_loop
     _app_config = config
@@ -127,22 +127,19 @@ def create_app(
     template_dir = Path(__file__).parent / "templates"
     app = Flask(__name__, template_folder=str(template_dir))
     app.secret_key = config.web.secret_key
+    app.extensions["app_context"] = context
 
-    # ---- 模块初始化 ----
-    market = MarketData(config.market)
-    symbols = SymbolManager(config.symbols, market)
-    engine = StrategyEngine(config)
-    broker = PaperBroker(config)
+    # ---- Shared application services ----
+    market = context.market
+    symbols = context.symbols
+    engine = context.strategies
     llm = LLMStrategyGenerator(config.llm) if config.llm.api_key else None
-    # 推送管理器：复用监测循环的实例或新建
-    notify_mgr = monitor_loop._notify_mgr if (monitor_loop and hasattr(monitor_loop, '_notify_mgr')) \
-        else NotificationManager(config)
+    notify_mgr = context.notifications
     # LOF 数据提供器
     lof_provider = LOFDataProvider(config.lof)
-    positions = PositionStore(str(Path(config.system.data_dir) / "positions.json"))
-    group_store = GroupStore(str(Path(config.system.data_dir) / "symbol_groups.json"))
-    group_store.ensure_defaults()
-    backtest_engine = BacktestEngine(config, engine, market)
+    positions = context.positions
+    group_store = context.groups
+    backtest_engine = BacktestEngine(config, engine, market, context.dividends.repository)
 
     # ==================================================================
     # 页面路由（返回 HTML）
@@ -477,7 +474,8 @@ def create_app(
             existing = engine.get(strategy_id)
             if existing is None:
                 return jsonify({"error": "策略不存在"}), 404
-            engine.delete(strategy_id)
+            record = engine.update(strategy_id, name=name, description=description, code=code)
+            return jsonify({"status": "ok", "id": record.id, "name": record.name})
 
         try:
             record = engine.create(
@@ -557,32 +555,8 @@ def create_app(
         date_to = request.args.get("date_to", "")
         limit = request.args.get("limit", 500, type=int)
 
-        orders = broker.get_orders()
-        result = []
-        for o in reversed(orders):
-            if symbol_filter and o.symbol != symbol_filter:
-                continue
-            if date_from and o.created_at[:10] < date_from:
-                continue
-            if date_to and o.created_at[:10] > date_to:
-                continue
-            result.append({
-                "order_id": o.order_id,
-                "symbol": o.symbol,
-                "side": o.side.value,
-                "price": o.price,
-                "quantity": o.quantity,
-                "status": o.status.value,
-                "filled_price": o.filled_price,
-                "filled_quantity": o.filled_quantity,
-                "commission": o.commission,
-                "created_at": o.created_at,
-                "reason": o.reason,
-            })
-            if len(result) >= limit:
-                break
-
-        return jsonify(result)
+        # Live monitoring produces alerts only; it no longer fabricates PaperBroker trades.
+        return jsonify([])
 
     # ==================================================================
     # API 路由 - 系统状态
@@ -827,43 +801,29 @@ def create_app(
     # ---- 兼容旧版 API（保留原有端点） ----
 
     @app.route("/api/status", methods=["GET"])
+    @login_required
     def get_status():
-        account = broker.get_account()
+        real_positions = positions.list_all()
+        total_cost = sum(p["shares"] * p["cost"] for p in real_positions)
         return jsonify({
             "mode": config.symbols.mode,
             "symbols_count": len(symbols.get_active_symbols()),
             "strategies_count": len(engine.list_all(enabled_only=True)),
             "account": {
-                "total_capital": account.total_capital,
-                "available_cash": account.available_cash,
-                "market_value": account.market_value,
-                "total_pnl": account.total_pnl,
-                "total_pnl_pct": account.total_pnl_pct,
+                "total_capital": total_cost,
+                "available_cash": None,
+                "market_value": None,
+                "total_pnl": None,
+                "total_pnl_pct": None,
             },
-            "positions": [
-                {
-                    "symbol": p.symbol,
-                    "shares": p.shares,
-                    "avg_cost": round(p.avg_cost, 4),
-                    "market_value": p.market_value,
-                    "unrealized_pnl": p.unrealized_pnl,
-                }
-                for p in broker.get_positions().values()
-            ],
+            "positions": real_positions,
         })
 
     @app.route("/api/signals", methods=["GET"])
+    @login_required
     def get_signals():
-        import sqlite3
         limit = request.args.get("limit", 50, type=int)
-        db_path = engine._db_path
-        conn = sqlite3.connect(str(db_path))
-        conn.row_factory = sqlite3.Row
-        rows = conn.execute(
-            "SELECT * FROM signal_log ORDER BY timestamp DESC LIMIT ?", (limit,)
-        ).fetchall()
-        conn.close()
-        return jsonify([dict(r) for r in rows])
+        return jsonify(engine.list_recent_signals(limit))
 
     @app.route("/api/positions", methods=["GET"])
     @login_required
@@ -1130,6 +1090,7 @@ def create_app(
         })
 
     @app.route("/api/account", methods=["GET"])
+    @login_required
     def get_account():
         real_pos = positions.list_all()
         total_mv, total_cost, total_pnl = 0.0, 0.0, 0.0
@@ -1190,6 +1151,7 @@ def run_web(
     host: str | None = None,
     port: int | None = None,
     monitor_loop=None,
+    context: AppContext | None = None,
     debug: bool = False,
 ):
     """启动 Web 管理界面。
@@ -1201,13 +1163,20 @@ def run_web(
         monitor_loop: MonitorLoop 实例（用于系统控制）。
         debug: 是否开启调试模式。
     """
-    config = AppConfig(config_path)
+    if context is None:
+        context = AppContext(AppConfig(config_path))
+    config = context.config
     actual_host = host or config.web.host
     actual_port = port or config.web.port
 
-    app = create_app(config, monitor_loop)
+    app = create_app(config, monitor_loop, context=context)
 
     logger.info(f"Web 管理控制台启动: http://{actual_host}:{actual_port}")
-    logger.info(f"默认密码: {config.web.password}（请在 config.yaml 中修改）")
+    default_passwords = {"admin123", "change-me"}
+    default_secrets = {"change-me-to-a-random-string", "secret"}
+    if config.web.password in default_passwords or config.web.secret_key in default_secrets:
+        logger.warning("Web 使用默认密码或 secret_key；请在 config.yaml 中修改")
+    if actual_host == "0.0.0.0" and (config.web.password in default_passwords or config.web.secret_key in default_secrets):
+        raise ValueError("拒绝使用默认密码或 secret_key 监听 0.0.0.0")
 
     app.run(host=actual_host, port=actual_port, debug=debug)

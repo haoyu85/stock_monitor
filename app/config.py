@@ -140,7 +140,7 @@ class MarketTimingConfig(BaseModel):
     ma_bear: int = 200
     strength_discount: float = 0.7
 class WebConfig(BaseModel):
-    host: str = "0.0.0.0"
+    host: str = "127.0.0.1"
     port: int = 5000
     password: str = "admin123"
     secret_key: str = "change-me-to-a-random-string"

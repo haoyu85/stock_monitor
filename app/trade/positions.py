@@ -6,6 +6,7 @@
 
 import json
 import logging
+from threading import RLock
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -24,6 +25,7 @@ class PositionStore:
         self._path = Path(filepath)
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._positions: dict[str, dict] = {}
+        self._lock = RLock()
         self._load()
 
     # ------------------------------------------------------------------
@@ -32,33 +34,38 @@ class PositionStore:
 
     def list_all(self) -> list[dict]:
         """返回所有持仓列表。"""
-        return list(self._positions.values())
+        with self._lock:
+            return [dict(position) for position in self._positions.values()]
 
     def get(self, symbol: str) -> dict | None:
         """获取单只持仓。"""
-        return self._positions.get(symbol)
+        with self._lock:
+            position = self._positions.get(symbol)
+            return dict(position) if position else None
 
     def add(self, symbol: str, shares: int, cost: float, date: str | None = None) -> None:
         """添加或更新持仓。"""
         from datetime import datetime
 
-        self._positions[symbol] = {
-            "symbol": symbol,
-            "shares": shares,
-            "cost": cost,
-            "date": date or datetime.now().strftime("%Y-%m-%d"),
-        }
-        self._save()
+        with self._lock:
+            self._positions[symbol] = {
+                "symbol": symbol,
+                "shares": shares,
+                "cost": cost,
+                "date": date or datetime.now().strftime("%Y-%m-%d"),
+            }
+            self._save()
         logger.info(f"持仓已更新: {symbol} {shares}股 @{cost}")
 
     def remove(self, symbol: str) -> bool:
         """删除持仓。"""
-        if symbol in self._positions:
-            del self._positions[symbol]
-            self._save()
-            logger.info(f"持仓已删除: {symbol}")
-            return True
-        return False
+        with self._lock:
+            if symbol in self._positions:
+                del self._positions[symbol]
+                self._save()
+                logger.info(f"持仓已删除: {symbol}")
+                return True
+            return False
 
     # ------------------------------------------------------------------
     # 内部

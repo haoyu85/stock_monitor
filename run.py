@@ -41,6 +41,7 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 from app.config import AppConfig
+from app.context import AppContext
 from app.scheduler.loop import MonitorLoop
 from app.web.server import run_web
 
@@ -81,7 +82,8 @@ def cmd_start(args, config: AppConfig) -> None:
     signal.signal(signal.SIGINT, _signal_handler)
     signal.signal(signal.SIGTERM, _signal_handler)
 
-    loop = MonitorLoop(config)
+    context = AppContext(config)
+    loop = MonitorLoop(context=context)
 
     # 在后台线程启动监测调度器
     def run_monitor():
@@ -98,6 +100,7 @@ def cmd_start(args, config: AppConfig) -> None:
             host=getattr(args, 'host', None) or config.web.host,
             port=getattr(args, 'port', None) or config.web.port,
             monitor_loop=loop,
+            context=context,
             debug=getattr(args, 'debug', False),
         )
     except (KeyboardInterrupt, SystemExit):
@@ -108,24 +111,26 @@ def cmd_start(args, config: AppConfig) -> None:
 
 def cmd_web_only(args, config: AppConfig) -> None:
     """仅启动 Web 管理界面（不运行监测）。"""
+    context = AppContext(config)
     run_web(
         config_path=args.config,
         host=args.host or config.web.host,
         port=args.port or config.web.port,
         monitor_loop=None,
+        context=context,
         debug=args.debug,
     )
 
 
 def cmd_monitor_only(args, config: AppConfig) -> None:
     """仅运行监测调度器（无 Web）。"""
-    loop = MonitorLoop(config)
+    loop = MonitorLoop(context=AppContext(config))
     loop.run_daemon()
 
 
 def cmd_once(args, config: AppConfig) -> None:
     """单次执行模式。"""
-    loop = MonitorLoop(config)
+    loop = MonitorLoop(context=AppContext(config))
     summary = loop.run_once()
 
     try:
