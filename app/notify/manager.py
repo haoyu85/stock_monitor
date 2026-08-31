@@ -10,6 +10,7 @@ import logging
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
+from threading import RLock
 from typing import Optional
 
 import yaml
@@ -45,12 +46,14 @@ class NotificationManager:
         history = mgr.get_history(level="warning", page=1)
     """
 
-    def __init__(self, config):
+    def __init__(self, config, config_write_lock=None):
         """
         Args:
             config: AppConfig 实例。
         """
         self._config = config
+        self._lock = RLock()
+        self._config_write_lock = config_write_lock or RLock()
         self._channels: dict[str, BaseNotifier] = {}
         self._history: list[dict] = []
         self._hourly_count: list[float] = []  # 最近1小时发送的时间戳
@@ -92,24 +95,24 @@ class NotificationManager:
 
     def get_channel_status(self) -> dict[str, dict]:
         """获取所有渠道的状态信息。"""
-        result = {}
-        raw_channels = self._config._raw_notification.get("channels", {})
-        for key, ch_cfg in raw_channels.items():
-            notifier = self._channels.get(key)
-            result[key] = {
-                "name": ch_cfg.get("name", key),
-                "enabled": ch_cfg.get("enabled", False),
-                "webhook_url": self._mask_url(ch_cfg.get("webhook_url", "")),
-                "connected": notifier is not None,
-                "config": {k: v for k, v in ch_cfg.items()
-                          if k not in ("webhook_url", "password", "username", "recipients")},
-            }
-            # 脱敏显示关键字段
-            if "username" in ch_cfg:
-                result[key]["username"] = self._mask_str(ch_cfg["username"])
-            if "recipients" in ch_cfg:
-                result[key]["recipients"] = [self._mask_str(r) for r in ch_cfg["recipients"]]
-        return result
+        with self._lock:
+            result = {}
+            raw_channels = self._config._raw_notification.get("channels", {})
+            for key, ch_cfg in raw_channels.items():
+                notifier = self._channels.get(key)
+                result[key] = {
+                    "name": ch_cfg.get("name", key),
+                    "enabled": ch_cfg.get("enabled", False),
+                    "webhook_url": self._mask_url(ch_cfg.get("webhook_url", "")),
+                    "connected": notifier is not None,
+                    "config": {k: v for k, v in ch_cfg.items()
+                              if k not in ("webhook_url", "password", "username", "recipients")},
+                }
+                if "username" in ch_cfg:
+                    result[key]["username"] = self._mask_str(ch_cfg["username"])
+                if "recipients" in ch_cfg:
+                    result[key]["recipients"] = [self._mask_str(r) for r in ch_cfg["recipients"]]
+            return result
 
     # ------------------------------------------------------------------
     # 发送与频率控制
@@ -125,6 +128,10 @@ class NotificationManager:
         Returns:
             成功返回 True（被频率限制跳过也返回 False）。
         """
+        with self._lock:
+            return self._send_unlocked(channel_key, notification)
+
+    def _send_unlocked(self, channel_key: str, notification: Notification) -> bool:
         if channel_key not in self._channels:
             logger.warning(f"渠道不存在: {channel_key}")
             return False
@@ -173,8 +180,10 @@ class NotificationManager:
 
     def send_all(self, notification: Notification) -> dict[str, bool]:
         """向所有已启用渠道发送通知。"""
+        with self._lock:
+            keys = list(self._channels)
         results = {}
-        for key in self._channels:
+        for key in keys:
             results[key] = self.send(key, notification)
         return results
 
@@ -189,6 +198,10 @@ class NotificationManager:
         Returns:
             成功返回 True。
         """
+        with self._lock:
+            return self._send_report_unlocked(channel_key, title, html_body)
+
+    def _send_report_unlocked(self, channel_key: str, title: str, html_body: str) -> bool:
         if channel_key not in self._channels:
             logger.warning(f"渠道不存在: {channel_key}")
             return False
@@ -232,22 +245,22 @@ class NotificationManager:
 
     def get_full_config(self) -> dict:
         """获取当前完整的推送配置（供 Web 页面展示）。"""
-        raw = self._config._raw_notification
-        channels_status = self.get_channel_status()
-        return {
-            "enabled": self._config.notification_enabled,
-            "quiet_hours": {
-                "enabled": self._quiet_enabled,
-                "start": self._quiet_start,
-                "end": self._quiet_end,
-            },
-            "frequency": {
-                "min_interval_minutes": self._min_interval,
-                "max_per_hour": self._max_per_hour,
-            },
-            "history_retention": self._history_retention,
-            "channels": channels_status,
-        }
+        with self._lock:
+            channels_status = self.get_channel_status()
+            return {
+                "enabled": self._config.notification_enabled,
+                "quiet_hours": {
+                    "enabled": self._quiet_enabled,
+                    "start": self._quiet_start,
+                    "end": self._quiet_end,
+                },
+                "frequency": {
+                    "min_interval_minutes": self._min_interval,
+                    "max_per_hour": self._max_per_hour,
+                },
+                "history_retention": self._history_retention,
+                "channels": channels_status,
+            }
 
     def update_config(self, new_config: dict) -> dict:
         """更新推送配置并持久化到 config.yaml。
@@ -259,61 +272,62 @@ class NotificationManager:
             {"status": "ok"} 或 {"status": "error", "message": "..."}。
         """
         try:
-            # 更新内存
-            if "enabled" in new_config:
-                self._config._raw_notification["enabled"] = new_config["enabled"]
-
-            if "quiet_hours" in new_config:
-                qh = new_config["quiet_hours"]
-                self._quiet_enabled = qh.get("enabled", True)
-                self._quiet_start = int(qh.get("start", 22))
-                self._quiet_end = int(qh.get("end", 8))
-                self._config._raw_notification["quiet_hours"] = {
-                    "enabled": self._quiet_enabled,
-                    "start": self._quiet_start,
-                    "end": self._quiet_end,
-                }
-
-            if "frequency" in new_config:
-                freq = new_config["frequency"]
-                self._min_interval = int(freq.get("min_interval_minutes", 5))
-                self._held_interval = int(freq.get("held_interval_minutes", 10))
-                self._watch_interval = int(freq.get("watch_interval_minutes", 60))
-                self._max_per_hour = int(freq.get("max_per_hour", 20))
-                self._config._raw_notification["frequency"] = {
-                    "min_interval_minutes": self._min_interval,
-                    "held_interval_minutes": self._held_interval,
-                    "watch_interval_minutes": self._watch_interval,
-                    "max_per_hour": self._max_per_hour,
-                }
-
-            if "history_retention" in new_config:
-                self._history_retention = int(new_config["history_retention"])
-                self._config._raw_notification["history_retention"] = self._history_retention
-
-            # 更新渠道启用状态
-            if "channels" in new_config:
-                for key, ch_data in new_config["channels"].items():
-                    channels_cfg = self._config._raw_notification.get("channels", {})
-                    if key in channels_cfg:
-                        if "enabled" in ch_data:
-                            channels_cfg[key]["enabled"] = ch_data["enabled"]
-                        if "webhook_url" in ch_data and ch_data.get("webhook_url"):
-                            channels_cfg[key]["webhook_url"] = ch_data["webhook_url"]
-                        # 邮箱字段
-                        for f in ("username", "password", "recipients", "smtp_host", "smtp_port"):
-                            if f in ch_data and ch_data[f]:
-                                channels_cfg[key][f] = ch_data[f]
-                        # 重新创建渠道实例
-                        self._init_channels()
-
-            # 持久化到 config.yaml
-            self._write_config_to_file()
-
-            return {"status": "ok"}
+            with self._lock:
+                return self._update_config_unlocked(new_config)
         except Exception as e:
             logger.error(f"更新推送配置失败: {e}", exc_info=True)
             return {"status": "error", "message": str(e)}
+
+    def _update_config_unlocked(self, new_config: dict) -> dict:
+        # 更新内存
+        if "enabled" in new_config:
+            self._config._raw_notification["enabled"] = new_config["enabled"]
+
+        if "quiet_hours" in new_config:
+            qh = new_config["quiet_hours"]
+            self._quiet_enabled = qh.get("enabled", True)
+            self._quiet_start = int(qh.get("start", 22))
+            self._quiet_end = int(qh.get("end", 8))
+            self._config._raw_notification["quiet_hours"] = {
+                "enabled": self._quiet_enabled,
+                "start": self._quiet_start,
+                "end": self._quiet_end,
+            }
+
+        if "frequency" in new_config:
+            freq = new_config["frequency"]
+            self._min_interval = int(freq.get("min_interval_minutes", 5))
+            self._held_interval = int(freq.get("held_interval_minutes", 10))
+            self._watch_interval = int(freq.get("watch_interval_minutes", 60))
+            self._max_per_hour = int(freq.get("max_per_hour", 20))
+            self._config._raw_notification["frequency"] = {
+                "min_interval_minutes": self._min_interval,
+                "held_interval_minutes": self._held_interval,
+                "watch_interval_minutes": self._watch_interval,
+                "max_per_hour": self._max_per_hour,
+            }
+
+        if "history_retention" in new_config:
+            self._history_retention = int(new_config["history_retention"])
+            self._config._raw_notification["history_retention"] = self._history_retention
+
+        # 更新渠道启用状态
+        if "channels" in new_config:
+            for key, ch_data in new_config["channels"].items():
+                channels_cfg = self._config._raw_notification.get("channels", {})
+                if key in channels_cfg:
+                    if "enabled" in ch_data:
+                        channels_cfg[key]["enabled"] = ch_data["enabled"]
+                    if "webhook_url" in ch_data and ch_data.get("webhook_url"):
+                        channels_cfg[key]["webhook_url"] = ch_data["webhook_url"]
+                    for f in ("username", "password", "recipients", "smtp_host", "smtp_port"):
+                        if f in ch_data and ch_data[f]:
+                            channels_cfg[key][f] = ch_data[f]
+                    self._init_channels()
+
+        self._write_config_to_file()
+
+        return {"status": "ok"}
 
     # ------------------------------------------------------------------
     # 历史记录
@@ -333,7 +347,8 @@ class NotificationManager:
         Returns:
             {"items": [...], "total": int, "page": int, "total_pages": int}
         """
-        items = list(self._history)
+        with self._lock:
+            items = [dict(item) for item in self._history]
 
         # 筛选
         if channel:
@@ -359,35 +374,38 @@ class NotificationManager:
 
     def clear_history(self) -> None:
         """清空所有推送历史。"""
-        self._history.clear()
-        self._title_timestamps.clear()
-        self._hourly_count.clear()
-        self._save_history()
+        with self._lock:
+            self._history.clear()
+            self._title_timestamps.clear()
+            self._hourly_count.clear()
+            self._save_history()
         logger.info("推送历史已清空")
+
+    def history_snapshot(self) -> list[dict]:
+        """Return a defensive copy for readers such as the Web status API."""
+        with self._lock:
+            return [dict(item) for item in self._history]
 
     def get_status(self) -> dict:
         """获取推送模块运行状态。"""
-        last = self._history[-1] if self._history else None
-        channels_ok = {}
-        for key in self._channels:
-            channels_ok[key] = True
-        # 检查配置中但未初始化的渠道
-        raw_channels = self._config._raw_notification.get("channels", {})
-        for key in raw_channels:
-            if key not in channels_ok:
-                channels_ok[key] = raw_channels[key].get("enabled", False)
-
-        return {
-            "channels": channels_ok,
-            "last_push_time": last["time"] if last else None,
-            "last_push_title": last["title"] if last else None,
-            "total_history": len(self._history),
-            "today_count": sum(
-                1 for h in self._history
-                if h.get("time", "").startswith(datetime.now().strftime("%Y-%m-%d"))
-            ),
-            "quiet_active": self._is_quiet_time(),
-        }
+        with self._lock:
+            last = self._history[-1] if self._history else None
+            channels_ok = {key: True for key in self._channels}
+            raw_channels = self._config._raw_notification.get("channels", {})
+            for key in raw_channels:
+                if key not in channels_ok:
+                    channels_ok[key] = raw_channels[key].get("enabled", False)
+            return {
+                "channels": channels_ok,
+                "last_push_time": last["time"] if last else None,
+                "last_push_title": last["title"] if last else None,
+                "total_history": len(self._history),
+                "today_count": sum(
+                    1 for h in self._history
+                    if h.get("time", "").startswith(datetime.now().strftime("%Y-%m-%d"))
+                ),
+                "quiet_active": self._is_quiet_time(),
+            }
 
     # ------------------------------------------------------------------
     # 内部方法
@@ -409,6 +427,13 @@ class NotificationManager:
     def _record_history(self, channel_key: str, notification: Notification,
                         success: bool, skip_reason: str = "") -> None:
         """记录推送历史。"""
+        # Callers commonly already hold the lock; RLock also keeps this helper
+        # safe for future standalone use.
+        with self._lock:
+            self._record_history_unlocked(channel_key, notification, success, skip_reason)
+
+    def _record_history_unlocked(self, channel_key: str, notification: Notification,
+                                 success: bool, skip_reason: str = "") -> None:
         entry = {
             "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "channel": channel_key,
@@ -459,14 +484,15 @@ class NotificationManager:
         """将当前内存配置写回 config.yaml。"""
         try:
             config_path = Path(__file__).parent.parent.parent / "config.yaml"
-            with open(config_path, encoding="utf-8") as f:
-                full = yaml.safe_load(f) or {}
+            with self._config_write_lock:
+                with open(config_path, encoding="utf-8") as f:
+                    full = yaml.safe_load(f) or {}
 
-            # 更新 notification 节
-            full["notification"] = self._build_raw_config()
+                # 更新 notification 节
+                full["notification"] = self._build_raw_config()
 
-            with open(config_path, "w", encoding="utf-8") as f:
-                yaml.dump(full, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
+                with open(config_path, "w", encoding="utf-8") as f:
+                    yaml.dump(full, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
 
             logger.info("推送配置已写回 config.yaml")
         except Exception as e:

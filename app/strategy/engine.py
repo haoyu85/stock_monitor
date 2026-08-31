@@ -10,13 +10,16 @@ import logging
 import sqlite3
 import uuid
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from threading import RLock
 from typing import Optional
 
 import pandas as pd
 
 from app.strategy.llm import _safe_builtins
+from app.strategy.signal_repository import SignalRepository
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +56,15 @@ class StrategyRecord:
         }
 
 
+@dataclass(frozen=True)
+class StrategyExecutionSnapshot:
+    """Compiled policy inputs pinned for one MonitorLoop execution."""
+
+    record: StrategyRecord
+    symbol_filter: object | None
+    cooldown: tuple[int, int]
+
+
 class StrategyEngine:
     """策略引擎。
 
@@ -74,8 +86,11 @@ class StrategyEngine:
         self._storage_dir.mkdir(parents=True, exist_ok=True)
         self._db_path = self._storage_dir / "strategies.db"
         self._init_db()
-        self._cache: dict[str, tuple[str, object, object | None]] = {}  # id -> (code_hash, func, filter_func)
+        self.signals = SignalRepository(self._db_path)
+        self._cache: dict[str, tuple[str, object, object | None, object | None]] = {}
+        # id -> (code_hash, strategy, symbol_filter, cooldown)
         self._record_cache: dict[str, StrategyRecord] = {}  # id -> record
+        self._lock = RLock()
 
     @contextmanager
     def _get_conn(self):
@@ -108,6 +123,10 @@ class StrategyEngine:
         Returns:
             StrategyRecord。
         """
+        with self._lock:
+            return self._create_unlocked(name, description, code, enabled)
+
+    def _create_unlocked(self, name: str, description: str, code: str, enabled: bool) -> StrategyRecord:
         strategy_id = uuid.uuid4().hex[:12]
         now = datetime.now().isoformat()
 
@@ -125,11 +144,55 @@ class StrategyEngine:
             conn.commit()
 
         record = StrategyRecord(strategy_id, name, description, code, enabled, now, now)
+        self._record_cache[strategy_id] = record
         logger.info(f"策略已创建: {name} (id={strategy_id})")
         return record
 
+    def update(
+        self,
+        strategy_id: str,
+        *,
+        name: str | None = None,
+        description: str | None = None,
+        code: str | None = None,
+        enabled: bool | None = None,
+    ) -> Optional[StrategyRecord]:
+        """Update a strategy in place, preserving its ID and signal history."""
+        with self._lock:
+            existing = self.get(strategy_id)
+            if existing is None:
+                return None
+            next_name = existing.name if name is None else name
+            next_description = existing.description if description is None else description
+            next_enabled = existing.enabled if enabled is None else enabled
+            next_code = existing.code if code is None else code
+            code_path = self._storage_dir / f"{strategy_id}.py"
+            # Keep built-in strategies in their existing files unless their code is edited.
+            with self._get_conn() as conn:
+                row = conn.execute("SELECT code_path FROM strategies WHERE id=?", (strategy_id,)).fetchone()
+                if row:
+                    code_path = Path(row[0])
+                code_path.write_text(next_code, encoding="utf-8")
+                now = datetime.now().isoformat()
+                conn.execute(
+                    """UPDATE strategies SET name=?, description=?, code_path=?, enabled=?, updated_at=?
+                       WHERE id=?""",
+                    (next_name, next_description, str(code_path), int(next_enabled), now, strategy_id),
+                )
+                conn.commit()
+            self._cache.pop(strategy_id, None)
+            record = StrategyRecord(strategy_id, next_name, next_description, next_code,
+                                    next_enabled, existing.created_at, now)
+            self._record_cache[strategy_id] = record
+            logger.info("策略已更新: %s (id=%s)", next_name, strategy_id)
+            return record
+
     def get(self, strategy_id: str) -> Optional[StrategyRecord]:
         """获取指定策略。"""
+        with self._lock:
+            return self._get_unlocked(strategy_id)
+
+    def _get_unlocked(self, strategy_id: str) -> Optional[StrategyRecord]:
         if strategy_id in self._record_cache:
             return self._record_cache[strategy_id]
 
@@ -159,7 +222,7 @@ class StrategyEngine:
 
     def list_all(self, enabled_only: bool = False) -> list[StrategyRecord]:
         """列出所有策略。"""
-        with self._get_conn() as conn:
+        with self._lock, self._get_conn() as conn:
             conn.row_factory = sqlite3.Row
             if enabled_only:
                 rows = conn.execute(
@@ -170,54 +233,52 @@ class StrategyEngine:
                     "SELECT * FROM strategies ORDER BY updated_at DESC"
                 ).fetchall()
 
-        records = []
-        for row in rows:
-            code_path = Path(row["code_path"])
-            code = code_path.read_text(encoding="utf-8") if code_path.exists() else ""
-            records.append(StrategyRecord(
-                strategy_id=row["id"],
-                name=row["name"],
-                description=row["description"],
-                code=code,
-                enabled=bool(row["enabled"]),
-                created_at=row["created_at"],
-                updated_at=row["updated_at"],
-            ))
-        return records
+            records = []
+            for row in rows:
+                code_path = Path(row["code_path"])
+                code = code_path.read_text(encoding="utf-8") if code_path.exists() else ""
+                records.append(StrategyRecord(
+                    strategy_id=row["id"],
+                    name=row["name"],
+                    description=row["description"],
+                    code=code,
+                    enabled=bool(row["enabled"]),
+                    created_at=row["created_at"],
+                    updated_at=row["updated_at"],
+                ))
+            return records
 
     def set_enabled(self, strategy_id: str, enabled: bool) -> bool:
         """启用或禁用策略。"""
-        with self._get_conn() as conn:
+        with self._lock, self._get_conn() as conn:
             conn.execute(
                 "UPDATE strategies SET enabled = ?, updated_at = ? WHERE id = ?",
                 (int(enabled), datetime.now().isoformat(), strategy_id),
             )
             affected = conn.total_changes
             conn.commit()
-
-        self._cache.pop(strategy_id, None)
-        self._record_cache.pop(strategy_id, None)
-
-        return affected > 0
+            self._cache.pop(strategy_id, None)
+            self._record_cache.pop(strategy_id, None)
+            return affected > 0
 
     def delete(self, strategy_id: str) -> bool:
         """删除策略。"""
-        with self._get_conn() as conn:
+        with self._lock, self._get_conn() as conn:
             row = conn.execute(
                 "SELECT code_path FROM strategies WHERE id = ?", (strategy_id,)
             ).fetchone()
             conn.execute("DELETE FROM strategies WHERE id = ?", (strategy_id,))
             conn.commit()
 
-        if row:
-            code_path = Path(row[0])
-            if code_path.exists():
-                code_path.unlink()
+            if row:
+                code_path = Path(row[0])
+                if code_path.exists():
+                    code_path.unlink()
 
-        self._cache.pop(strategy_id, None)
-        self._record_cache.pop(strategy_id, None)
-        logger.info(f"策略已删除: {strategy_id}")
-        return True
+            self._cache.pop(strategy_id, None)
+            self._record_cache.pop(strategy_id, None)
+            logger.info(f"策略已删除: {strategy_id}")
+            return True
 
     # ------------------------------------------------------------------
     # 策略执行
@@ -240,6 +301,10 @@ class StrategyEngine:
             策略执行结果 dict，格式 {"action": ..., "reason": ..., "strength": ...}。
         """
         record = self.get(strategy_id)
+        return self.execute_record(record, context, data)
+
+    def execute_record(self, record: StrategyRecord | None, context: dict, data: pd.DataFrame) -> dict:
+        """Execute a monitor-pinned record without reloading mutable CRUD state."""
         if record is None:
             return {"action": "hold", "reason": "策略不存在", "strength": 0.0}
 
@@ -267,66 +332,11 @@ class StrategyEngine:
         Returns:
             [{"signal": dict, "review": {"days": N, "pnl_pct": X, "correct": bool}}, ...]
         """
-        if days_list is None:
-            days_list = [3, 7, 21]
-        today = datetime.now().strftime("%Y-%m-%d")
-        results = []
-        with self._get_conn() as conn:
-            conn.row_factory = None
-            for days in days_list:
-                from datetime import timedelta as _td
-                target_date = (datetime.now() - _td(days=days)).strftime("%Y-%m-%d")
-                rows = conn.execute(
-                    """SELECT s.id, s.symbol, s.action, s.price, s.strategy_name, s.timestamp, s.reason
-                       FROM signal_log s
-                       LEFT JOIN signal_review r ON s.id = r.signal_id AND r.review_date = ?
-                       WHERE date(s.timestamp) = ? AND r.signal_id IS NULL
-                       ORDER BY s.timestamp""",
-                    (today, target_date)
-                ).fetchall()
-                for row in rows:
-                    sig_id, sym, action, sig_price, sname, ts, reason = row
-                    cur_price = price_map.get(sym, 0)
-                    if cur_price <= 0 or sig_price <= 0:
-                        continue
-                    if action == "buy":
-                        pnl_pct = round((cur_price / sig_price - 1) * 100, 2)
-                        correct = 1 if cur_price > sig_price else 0
-                    else:
-                        pnl_pct = round((sig_price / cur_price - 1) * 100, 2)
-                        correct = 1 if cur_price < sig_price else 0
-                    # 写入 review
-                    conn.execute(
-                        """INSERT OR REPLACE INTO signal_review
-                           VALUES (?, ?, ?, ?, ?, ?)""",
-                        (sig_id, today, sig_price, cur_price, pnl_pct, correct)
-                    )
-                    results.append({
-                        "signal": {"id": sig_id, "symbol": sym, "action": action,
-                                   "price": sig_price, "strategy_name": sname,
-                                   "timestamp": ts, "reason": reason},
-                        "review": {"days": days, "pnl_pct": pnl_pct, "correct": bool(correct),
-                                   "review_price": cur_price},
-                    })
-            conn.commit()
-        return results
+        return self._signal_repository().review_signals(price_map, days_list)
 
     def signal_stats(self) -> dict:
         """获取信号全局统计。"""
-        with self._get_conn() as conn:
-            total_row = conn.execute("SELECT COUNT(*) FROM signal_log").fetchone()
-            total = total_row[0] if total_row else 0
-            rev_row = conn.execute(
-                "SELECT COUNT(*), SUM(correct) FROM signal_review"
-            ).fetchone()
-            reviewed = rev_row[0] if rev_row else 0
-            correct = rev_row[1] if rev_row and rev_row[1] else 0
-        return {
-            "total_signals": total,
-            "reviewed": reviewed,
-            "correct": correct or 0,
-            "accuracy": round((correct or 0) / reviewed * 100, 1) if reviewed > 0 else 0,
-        }
+        return self._signal_repository().signal_stats()
 
     # ------------------------------------------------------------------
     # 内部方法
@@ -412,6 +422,10 @@ class StrategyEngine:
 
     def _load_func(self, record: StrategyRecord):
         """加载并编译策略函数（带缓存）。"""
+        with self._lock:
+            return self._load_func_unlocked(record)
+
+    def _load_func_unlocked(self, record: StrategyRecord):
         code_hash = hashlib.md5(record.code.encode()).hexdigest()
 
         if record.id in self._cache:
@@ -434,24 +448,43 @@ class StrategyEngine:
         Returns:
             callable(all_symbols, meta) -> list[str]，或 None。
         """
-        record = self._record_cache.get(strategy_id) or self.get(strategy_id)
-        if record is None:
-            return None
-        self._load_func(record)  # ensure cached
-        return self._cache[record.id][2]
+        with self._lock:
+            record = self._record_cache.get(strategy_id) or self._get_unlocked(strategy_id)
+            if record is None:
+                return None
+            self._load_func_unlocked(record)  # ensure cached
+            return self._cache[record.id][2]
 
     def get_cooldown(self, strategy_id: str) -> tuple[int, int]:
         """获取策略的回测冷却周期 (buy_days, sell_days)。0 表示仅当日去重。"""
-        record = self._record_cache.get(strategy_id) or self.get(strategy_id)
-        if record is None:
-            return (0, 0)
-        self._load_func(record)
+        with self._lock:
+            record = self._record_cache.get(strategy_id) or self._get_unlocked(strategy_id)
+            if record is None:
+                return (0, 0)
+            self._load_func_unlocked(record)
+            return self._cooldown_from_cached(record)
+
+    def execution_snapshot(self) -> list[StrategyExecutionSnapshot]:
+        """Return records and policy hooks captured under the engine lock."""
+        with self._lock:
+            snapshots = []
+            for record in self.list_all(enabled_only=True):
+                self._load_func_unlocked(record)
+                snapshots.append(StrategyExecutionSnapshot(
+                    record=record,
+                    symbol_filter=self._cache[record.id][2],
+                    cooldown=self._cooldown_from_cached(record),
+                ))
+            return snapshots
+
+    def _cooldown_from_cached(self, record: StrategyRecord) -> tuple[int, int]:
         cooldown_func = self._cache[record.id][3]
         if cooldown_func:
             try:
-                return cooldown_func()
+                value = cooldown_func()
+                return int(value[0]), int(value[1])
             except Exception:
-                pass
+                logger.warning("策略冷却函数异常: %s", record.name, exc_info=True)
         return (0, 0)
 
     @staticmethod
@@ -476,23 +509,31 @@ class StrategyEngine:
         reason: str,
         strength: float,
     ) -> None:
-        """记录信号到数据库。"""
-        with self._get_conn() as conn:
-            conn.execute(
-                """INSERT INTO signal_log
-                   (timestamp, strategy_id, strategy_name, symbol, action, price, reason, strength)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                (datetime.now().isoformat(), strategy_id, strategy_name, symbol, action, price, reason, strength),
-            )
-            conn.commit()
+        """Compatibility wrapper for a one-record signal write."""
+        self.log_signals_batch([{
+            "strategy_id": strategy_id, "strategy_name": strategy_name, "symbol": symbol,
+            "action": action, "price": price, "reason": reason, "strength": strength,
+        }])
+
+    def log_signals_batch(self, records: list[dict]) -> None:
+        """Persist monitor signals in one SQLite transaction."""
+        self._signal_repository().log_batch(records)
+
+    def load_today_signal_keys(self) -> set[tuple[str, str, str]]:
+        return self._signal_repository().today_keys()
+
+    def load_recent_signal_ticks(self) -> dict[tuple[str, str, str], int]:
+        return self._signal_repository().recent_signal_ticks()
+
+    def list_recent_signals(self, limit: int = 50) -> list[dict]:
+        return self._signal_repository().list_recent(limit)
+
+    def _signal_repository(self) -> SignalRepository:
+        """Keep legacy test/custom DB-path overrides compatible with the repository."""
+        if self.signals._db_path != self._db_path:
+            self.signals = SignalRepository(self._db_path)
+        return self.signals
 
     def has_signal_today(self, strategy_id: str, symbol: str, action: str) -> bool:
         """检查今天同一标的+策略+方向是否已产生过信号。"""
-        today = datetime.now().strftime("%Y-%m-%d")
-        with self._get_conn() as conn:
-            row = conn.execute(
-                "SELECT COUNT(*) FROM signal_log "
-                "WHERE strategy_id=? AND symbol=? AND action=? AND timestamp >= ?",
-                (strategy_id, symbol, action, today),
-            ).fetchone()
-            return row[0] > 0
+        return (strategy_id, symbol, action) in self.load_today_signal_keys()

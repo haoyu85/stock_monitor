@@ -7,7 +7,9 @@
 """
 
 import logging
+from dataclasses import dataclass
 from pathlib import Path
+from threading import RLock
 from typing import Optional
 
 import pandas as pd
@@ -15,6 +17,12 @@ import pandas as pd
 from app.market.data import MarketData
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class SymbolSnapshot:
+    symbols: tuple[str, ...]
+    meta: dict[str, dict]
 
 
 class SymbolManager:
@@ -28,7 +36,7 @@ class SymbolManager:
         grouped = mgr.get_grouped_symbols()      # -> {'宽基ETF': [...], '行业ETF': [...]}
     """
 
-    def __init__(self, config, market_data: MarketData):
+    def __init__(self, config, market_data: MarketData, config_write_lock=None):
         """
         Args:
             config: SymbolsConfig 实例。
@@ -39,6 +47,8 @@ class SymbolManager:
         self._pool: list[str] = []      # 当前活动标的池（纯代码）
         self._meta: dict[str, dict] = {}  # 代码 -> 元信息（名称、类型等）
         self._groups: dict[str, list[str]] = {}  # 分组名 -> 代码列表
+        self._lock = RLock()
+        self._config_write_lock = config_write_lock or RLock()
         self._refresh_pool()
 
     # ------------------------------------------------------------------
@@ -47,16 +57,26 @@ class SymbolManager:
 
     def get_active_symbols(self) -> list[str]:
         """返回当前活动标的代码列表。"""
-        blacklist = set(self._config.blacklist)
-        return [s for s in self._pool if s not in blacklist]
+        with self._lock:
+            blacklist = set(self._config.blacklist)
+            return [s for s in self._pool if s not in blacklist]
+
+    def snapshot(self) -> SymbolSnapshot:
+        """Return an immutable symbol set plus defensive metadata copies."""
+        with self._lock:
+            blacklist = set(self._config.blacklist)
+            symbols = tuple(symbol for symbol in self._pool if symbol not in blacklist)
+            return SymbolSnapshot(symbols, {symbol: dict(self._meta.get(symbol, {})) for symbol in symbols})
 
     def get_grouped_symbols(self) -> dict[str, list[str]]:
         """返回分组结构。"""
-        return dict(self._groups)
+        with self._lock:
+            return {group: list(symbols) for group, symbols in self._groups.items()}
 
     def get_meta(self, symbol: str) -> dict:
         """获取单个标的的元信息。"""
-        return self._meta.get(symbol, {"name": symbol, "type": "unknown"})
+        with self._lock:
+            return dict(self._meta.get(symbol, {"name": symbol, "type": "unknown"}))
 
     def set_mode(self, mode: str) -> None:
         """切换标的筛选模式。
@@ -66,27 +86,30 @@ class SymbolManager:
         """
         if mode not in ("specific", "full_market"):
             raise ValueError(f"无效模式: {mode}")
-        self._config.mode = mode
-        self._refresh_pool()
+        with self._lock:
+            self._config.mode = mode
+            self._refresh_pool()
 
     def add_symbol(self, symbol: str, group: str | None = None) -> None:
         """手动添加标的到监测池，同步持久化到 config.yaml。"""
-        if group is None:
-            group = "ETF" if symbol.startswith(("5", "1", "58", "16")) else "股票"
-        if symbol not in self._pool:
-            self._pool.append(symbol)
-        self._groups.setdefault(group, [])
-        if symbol not in self._groups[group]:
-            self._groups[group].append(symbol)
-        self._save_config_groups()
+        with self._lock:
+            if group is None:
+                group = "ETF" if symbol.startswith(("5", "1", "58", "16")) else "股票"
+            if symbol not in self._pool:
+                self._pool.append(symbol)
+            self._groups.setdefault(group, [])
+            if symbol not in self._groups[group]:
+                self._groups[group].append(symbol)
+            self._save_config_groups()
 
     def remove_symbol(self, symbol: str) -> None:
         """从监测池移除标的，同步持久化到 config.yaml。"""
-        self._pool = [s for s in self._pool if s != symbol]
-        for g in self._groups.values():
-            if symbol in g:
-                g.remove(symbol)
-        self._save_config_groups()
+        with self._lock:
+            self._pool = [s for s in self._pool if s != symbol]
+            for g in self._groups.values():
+                if symbol in g:
+                    g.remove(symbol)
+            self._save_config_groups()
 
     def _save_config_groups(self) -> None:
         """将当前分组写回 config.yaml。"""
@@ -95,22 +118,24 @@ class SymbolManager:
         if not config_path.exists():
             return
         try:
-            raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
-            # 只更新 symbols.groups，保留其他字段
-            raw.setdefault("symbols", {})["groups"] = {
-                g: list(codes) for g, codes in self._groups.items() if codes
-            }
-            config_path.write_text(
-                yaml.dump(raw, allow_unicode=True, default_flow_style=False, sort_keys=False),
-                encoding="utf-8",
-            )
+            with self._config_write_lock:
+                raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+                # 只更新 symbols.groups，保留其他字段
+                raw.setdefault("symbols", {})["groups"] = {
+                    g: list(codes) for g, codes in self._groups.items() if codes
+                }
+                config_path.write_text(
+                    yaml.dump(raw, allow_unicode=True, default_flow_style=False, sort_keys=False),
+                    encoding="utf-8",
+                )
             logger.info(f"配置已持久化: {len(self._pool)} 个标的")
         except Exception as e:
             logger.error(f"保存配置失败: {e}")
 
     def refresh(self) -> None:
         """强制刷新标的池（全市场模式时重新扫描）。"""
-        self._refresh_pool()
+        with self._lock:
+            self._refresh_pool()
 
     # ------------------------------------------------------------------
     # 内部方法
@@ -178,12 +203,12 @@ class SymbolManager:
 
     def to_dataframe(self) -> pd.DataFrame:
         """将当前标的池输出为 DataFrame，方便展示。"""
-        rows = []
-        for sym in self.get_active_symbols():
-            meta = self._meta.get(sym, {})
-            rows.append({
-                "symbol": sym,
-                "name": meta.get("name", sym),
-                "group": meta.get("group", ""),
-            })
-        return pd.DataFrame(rows)
+        snapshot = self.snapshot()
+        return pd.DataFrame([
+            {
+                "symbol": symbol,
+                "name": snapshot.meta.get(symbol, {}).get("name", symbol),
+                "group": snapshot.meta.get(symbol, {}).get("group", ""),
+            }
+            for symbol in snapshot.symbols
+        ])

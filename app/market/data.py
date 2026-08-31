@@ -8,6 +8,7 @@
 import logging
 import sqlite3
 import time
+from threading import RLock
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -41,6 +42,7 @@ class MarketData:
         self._last_request_time: float = 0.0
         self._cache: dict[str, tuple[float, pd.DataFrame]] = {}
         self._max_cache_size: int = 128
+        self._lock = RLock()
         # SQLite K线本地存储
         self._kline_db = Path("data/kline.db")
         self._kline_db.parent.mkdir(parents=True, exist_ok=True)
@@ -72,6 +74,8 @@ class MarketData:
         symbol: str,
         period: str = "days",
         freq: str = "daily",
+        bars: int | None = None,
+        force_refresh: bool = False,
     ) -> pd.DataFrame:
         """获取历史K线数据。
 
@@ -83,32 +87,62 @@ class MarketData:
         Returns:
             DataFrame，包含 OHLCV 及日期索引。
         """
-        cache_key = f"hist_{symbol}_{period}_{freq}"
-        if cache_key in self._cache:
-            ts, df = self._cache[cache_key]
-            if time.time() - ts < self._config.cache_ttl:
-                return df.copy()
+        bars = bars or 250
+        cache_key = f"hist_{symbol}_{period}_{freq}_{bars}"
+        with self._lock:
+            if not force_refresh and cache_key in self._cache:
+                ts, df = self._cache[cache_key]
+                if time.time() - ts < self._config.cache_ttl:
+                    return df.copy()
 
         # 优先从本地 SQLite 读取（检查新鲜度）
         df = self._read_kline_from_db(symbol)
-        if not df.empty:
+        if not force_refresh and not df.empty and len(df) >= bars * 0.9:
             latest = df.index[-1]
             age_days = (datetime.now() - latest).days if hasattr(latest, 'date') else 99
             if age_days <= 2:  # 2 天内数据视为有效
-                self._cache[cache_key] = (time.time(), df)
+                with self._lock:
+                    self._cache[cache_key] = (time.time(), df.copy())
                 return df
 
         try:
-            df = self._fetch_history(symbol, period, freq)
+            df = self._fetch_history(symbol, period, freq, bars=bars)
             self._write_kline_to_db(symbol, df)
-            self._cache[cache_key] = (time.time(), df)
-            if len(self._cache) > self._max_cache_size:
-                oldest_key = min(self._cache, key=lambda k: self._cache[k][0])
-                del self._cache[oldest_key]
-            return df
+            with self._lock:
+                self._cache[cache_key] = (time.time(), df.copy())
+                if len(self._cache) > self._max_cache_size:
+                    oldest_key = min(self._cache, key=lambda k: self._cache[k][0])
+                    del self._cache[oldest_key]
+            return df.copy()
         except Exception as e:
             logger.error(f"获取历史数据失败 {symbol}: {e}")
             raise MarketDataError(f"历史数据获取失败 {symbol}: {e}") from e
+
+    def invalidate_history(self, symbols: list[str]) -> None:
+        """Invalidate memory and SQLite history through a supported public boundary."""
+        symbols = [str(symbol) for symbol in symbols]
+        with self._lock:
+            for cache_key in list(self._cache):
+                if any(cache_key.startswith(f"hist_{symbol}_") for symbol in symbols):
+                    self._cache.pop(cache_key, None)
+        with sqlite3.connect(str(self._kline_db)) as conn:
+            conn.executemany("DELETE FROM kline_daily WHERE symbol=?", [(symbol,) for symbol in symbols])
+
+    def ensure_history(self, symbols: list[str], bars: int) -> None:
+        """Ensure a requested history depth is available for consumers such as backtests."""
+        if not symbols:
+            return
+        missing = []
+        for symbol in symbols:
+            cached = self._read_kline_from_db(symbol)
+            if len(cached) < bars * 0.9:
+                missing.append(symbol)
+        if not missing:
+            logger.info("K线缓存已满足回测要求 (%s条)", bars)
+            return
+        logger.info("刷新 %s 只标的的 %s 条K线", len(missing), bars)
+        self.invalidate_history(missing)
+        self.preload_kline_cache(missing, bars=bars)
 
     def get_all_etfs(self) -> pd.DataFrame:
         """获取全市场 ETF 列表。
@@ -173,10 +207,11 @@ class MarketData:
 
     def _rate_limit(self) -> None:
         """请求频率控制，确保调用间隔不小于配置值。"""
-        elapsed = time.time() - self._last_request_time
-        if elapsed < self._config.request_interval:
-            time.sleep(self._config.request_interval - elapsed)
-        self._last_request_time = time.time()
+        with self._lock:
+            elapsed = time.time() - self._last_request_time
+            if elapsed < self._config.request_interval:
+                time.sleep(self._config.request_interval - elapsed)
+            self._last_request_time = time.time()
 
     @retry(
         stop=stop_after_attempt(3),
@@ -235,21 +270,27 @@ class MarketData:
             if len(data) < 32:
                 continue
             try:
-                pct_idx = 32
+                price = float(data[3])
+                pre_close = float(data[2])
+                # Sina can return 0 for yesterday's close during suspension,
+                # listing transitions, or a partial quote.  Keep the quote and
+                # make only the derived percentage unavailable-as-zero; a bad
+                # row must never abort the complete realtime batch.
+                pct_change = round((price / pre_close - 1) * 100, 2) if pre_close > 0 else 0.0
                 rows.append({
                     "symbol": code[2:],  # sh510050 → 510050
                     "name": data[0],
-                    "price": float(data[3]),
+                    "price": price,
                     "open": float(data[1]),
-                    "pre_close": float(data[2]),
+                    "pre_close": pre_close,
                     "high": float(data[4]),
                     "low": float(data[5]),
                     "volume": float(data[8]) if data[8] else 0,
                     "amount": float(data[9]) if data[9] else 0,
-                    "pct_change": round((float(data[3]) / float(data[2]) - 1) * 100, 2),
-                    "change": round(float(data[3]) - float(data[2]), 4),
+                    "pct_change": pct_change,
+                    "change": round(price - pre_close, 4),
                 })
-            except (ValueError, IndexError):
+            except (ValueError, IndexError, ZeroDivisionError):
                 continue
         return rows
 
@@ -260,7 +301,7 @@ class MarketData:
         reraise=True,
     )
     def _fetch_history(
-        self, symbol: str, period: str, freq: str
+        self, symbol: str, period: str, freq: str, bars: int = 250
     ) -> pd.DataFrame:
         """通过 Sina K 线 API 获取历史数据。"""
         import requests
@@ -269,7 +310,7 @@ class MarketData:
         code = f"{prefix}{symbol}"
 
         url = "https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData"
-        params = {"symbol": code, "scale": "240", "ma": "5,10,20", "datalen": "250"}
+        params = {"symbol": code, "scale": "240", "ma": "5,10,20", "datalen": str(bars)}
         headers = {"Referer": "https://finance.sina.com.cn"}
         resp = requests.get(url, params=params, headers=headers,
                           timeout=self._config.timeout)
@@ -361,7 +402,7 @@ class MarketData:
         except Exception as e:
             logger.error(f"写入K线DB失败 {symbol}: {e}")
 
-    def preload_kline_cache(self, symbols: list[str]) -> None:
+    def preload_kline_cache(self, symbols: list[str], bars: int = 250) -> None:
         """预热 K 线缓存：对未缓存的标的从 API 拉取并写入 SQLite。"""
         to_fetch = []
         for s in symbols:
@@ -376,7 +417,7 @@ class MarketData:
         logger.info(f"预热 K线缓存: {len(to_fetch)} 只需要拉取")
         from concurrent.futures import ThreadPoolExecutor, as_completed
         with ThreadPoolExecutor(max_workers=8) as pool:
-            futures = {pool.submit(self._fetch_history, s, "days", "daily"): s for s in to_fetch}
+            futures = {pool.submit(self._fetch_history, s, "days", "daily", bars): s for s in to_fetch}
             for f in as_completed(futures):
                 sym = futures[f]
                 try:

@@ -79,7 +79,7 @@ lof:
     recipient: your@email.com
     top_n: 0
 web:
-  host: 0.0.0.0
+  host: 127.0.0.1
   port: 5000
   password: admin123
   secret_key: change-me-to-a-random-string
