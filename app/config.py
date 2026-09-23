@@ -59,7 +59,7 @@ notification:
     feishu:
       name: 飞书机器人
       enabled: true
-      webhook_url: https://open.feishu.cn/open-apis/bot/v2/hook/https://open.feishu.cn/open-apis/bot/v2/hook/c8ad5e88-5306-4fd6-8bed-9812b3dc20b2
+      webhook_url: "${FEISHU_WEBHOOK_URL}"
       keyword: 股票监控
     email:
       enabled: false
