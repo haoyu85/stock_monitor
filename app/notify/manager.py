@@ -93,6 +93,19 @@ class NotificationManager:
             from app.notify.email_ import EmailNotifier
             self._channels["email"] = EmailNotifier(cfg)
 
+        # ================= 新增：飞书渠道 =================
+        channels_cfg = cfg._raw_notification.get("channels", {})
+        feishu_cfg = channels_cfg.get("feishu", {})
+        if feishu_cfg.get("enabled", False):
+            from app.notify.feishu import FeishuNotifier
+            webhook_url = feishu_cfg.get("webhook_url", "")
+            keyword = feishu_cfg.get("keyword", "股票监控")
+            if webhook_url:
+                self._channels["feishu"] = FeishuNotifier(webhook_url, keyword)
+                logger.info("飞书推送渠道已启用")
+            else:
+                logger.warning("飞书渠道已启用，但未配置 webhook_url")
+        # ====================================================
     def get_channel_status(self) -> dict[str, dict]:
         """获取所有渠道的状态信息。"""
         with self._lock:
